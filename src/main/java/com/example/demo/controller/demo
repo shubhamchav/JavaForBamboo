@@ -1,0 +1,1072 @@
+name: Github Actions - default
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "environment to deploy"
+        type: environment
+        required: true
+  push:
+    branches:
+      - development
+
+  pull_request:
+    branches:
+      - development
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+  set-environment:
+    runs-on: repspark-runner
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+    steps:
+      - name: Set environment
+        id: set-env
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            echo "environment=${{ github.event.inputs.environment }}" >> $env:GITHUB_OUTPUT
+          }
+          elseif ("${{ github.event_name }}" -eq "push") {
+            if ("${{ github.ref }}" -eq "refs/heads/master") {
+              echo "environment=production" >> $env:GITHUB_OUTPUT
+            }
+            elseif ("${{ github.ref }}" -eq "refs/heads/UAT") {
+              echo "environment=UAT" >> $env:GITHUB_OUTPUT
+            }
+            else {
+              echo "environment=development" >> $env:GITHUB_OUTPUT
+            }
+          }
+          else {
+            echo "environment=development" >> $env:GITHUB_OUTPUT
+          }
+
+  deployment-window:
+    needs: set-environment
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    steps:
+      - name: Check Deployment Window
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
+        env:
+          not_allowed_window_start_hour_utc: ${{ vars.NOT_ALLOWED_WINDOW_START_HOUR_UTC }}
+          not_allowed_window_end_hour_utc: ${{ vars.NOT_ALLOWED_WINDOW_END_HOUR_UTC }}
+          not_allowed_window_end_minute_utc: ${{ vars.NOT_ALLOWED_WINDOW_END_MINUTE_UTC }}
+
+        run: |
+          echo "test"
+          # Get the current time in UTC
+          $currentTime = (Get-Date).ToUniversalTime()
+
+          # Define the start and end times (17:00 to 23:00 UTC)
+          $startTime = (Get-Date).Date.AddHours(${{env.not_allowed_window_start_hour_utc}}).ToUniversalTime()
+          $endTime = (Get-Date).Date.AddHours(${{env.not_allowed_window_end_hour_utc}}).AddMinutes(${{env.not_allowed_window_end_minute_utc}}).ToUniversalTime()
+
+          # Check if the current time is within the time window
+          if ($currentTime -ge $startTime -and $currentTime -le $endTime) {
+              echo "::error ::Deployment cannot proceed because the current time is within the restricted window (${{env.not_allowed_window_start_hour_utc}}:00 UTC to ${{env.not_allowed_window_end_hour_utc}}:${{env.not_allowed_window_end_minute_utc}} UTC)."
+              exit 1;
+          }
+          else
+          {
+            echo "::notice ::Deployment allowed"; echo "Deploying to ${{ needs.set-environment.outputs.environment }} environment"
+          }
+
+  prerequisite:
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+
+    needs: [set-environment, deployment-window]
+    outputs:
+      BRANCH_NAME: ${{ steps.extract_branch.outputs.branch_name }}
+      GIT_DIR_PATH: ${{ steps.update_directory_path.outputs.git-dir-path}}
+    steps:
+      - name: Extract branch name
+        id: extract_branch
+        run: |
+          echo "${{ needs.set-environment.outputs.environment }}"
+          if ($env:GITHUB_HEAD_REF) {
+              $branch_name = $env:GITHUB_HEAD_REF
+          } else {
+              $branch_name = $env:GITHUB_REF -replace 'refs/heads/', ''
+          }
+          echo "branch_name=$branch_name" >> $Env:GITHUB_OUTPUT
+      - name: Update GIT_DIR_PATH
+        id: update_directory_path
+        run: |
+          $env:GIT_DIR_PATH="${{ github.workspace }}\${{ steps.extract_branch.outputs.branch_name }}\RepSpark"
+          echo "GIT_DIR_PATH is now $env:GIT_DIR_PATH"
+          echo "git-dir-path=$env:GIT_DIR_PATH" >> $Env:GITHUB_OUTPUT
+      - uses: actions/checkout@v3
+        with:
+          path: "${{ steps.extract_branch.outputs.branch_name }}\\RepSpark"
+
+  build:
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite]
+    steps:
+      # Slack notification
+      - name: deployment start - slack notification
+        id: slack
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "image",
+                      "image_url": "https://via.placeholder.com/15/007bff/007bff.png",
+                      "alt_text": "build status"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Build Started:* `${{ needs.set-environment.outputs.environment }}` #`${{ github.run_number }}`"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # Copy core config files
+      - name: Copy Core Config Files
+        run: |
+          echo ${{ env.GIT_DIR_PATH }}
+          cd ${{ env.GIT_DIR_PATH }}
+          # Copy core config files based on branch name
+          Copy-Item -Path "Core/RepSparkWebApp/Configs/${{ needs.set-environment.outputs.environment }}/*" -Destination "Core/RepSparkWebApp/" -Force -Verbose
+          Copy-Item -Path "Daemon/RepSpark.Integration.Daemon/Configs/${{ needs.set-environment.outputs.environment }}/*" -Destination "Daemon/RepSpark.Integration.Daemon/" -Force -Verbose
+          Copy-Item -Path "CI/RepSpark.JsonSchemaGenerator/Configs/${{ needs.set-environment.outputs.environment }}/*" -Destination "CI/RepSpark.JsonSchemaGenerator/" -Force -Verbose
+          (Get-Content Core/RepSparkWebApp/WebAppSettings.config) -replace "%%RESOURCE_VERSION%%", "${{ github.run_number }}" | Set-Content Core/RepSparkWebApp/WebAppSettings.config
+          (Get-Content Daemon/RepSpark.Integration.Daemon/appsettings.json) -replace "%%PLUGIN_VERSION%%", "${{ github.run_number }}" | Set-Content Daemon/RepSpark.Integration.Daemon/appsettings.json
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  build-admin-accelerate:
+    runs-on:
+      - admin-accelerate
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, build]
+    steps:
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "${{ env.NODE_VERSION }}"
+        env:
+          NODE_VERSION: ${{ vars.NODE_VERSION }}
+      - name: Install Yarn
+        run: |
+          npm install -g yarn
+          npm install -g vite
+          corepack enable
+          corepack prepare yarn@stable --activate
+          yarn --version
+      - name: ReactComponents - Accelerate
+        run: |
+          echo ${{ env.GIT_DIR_PATH }}
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/Scripts/ReactComponents/Accelerate
+          yarn install
+          yarn build
+        env:
+          CI: ""
+
+      - name: ReactComponents - admin-dashboard
+        run: |
+          cd "${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/Scripts/ReactComponents/admin-dashboard"
+          npm install --legacy-peer-deps
+          npm run webpack.admindashboard.prod
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  build-cch:
+    runs-on:
+      - cch
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, build]
+    steps:
+      - name: CCH UI
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/CCH\\Customer-Communication-Hub-UI
+          npm install
+          npm run ng -- build --prod --configuration=${{ needs.set-environment.outputs.environment }}
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  msbuild:
+    runs-on:
+      - msbuild
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, build]  
+    steps:
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "${{ env.NODE_VERSION }}"
+        env:
+          NODE_VERSION: ${{ vars.NODE_VERSION }}
+      - name: Install Yarn
+        run: |
+          npm install -g yarn
+          npm install -g vite
+          corepack enable
+          corepack prepare yarn@stable --activate
+          yarn --version
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2.0.0
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DAEMON_DOTNET_VERSION }}
+        env:
+          DAEMON_DOTNET_VERSION: ${{ vars.DAEMON_DOTNET_VERSION }}
+
+      - name: Install dependencies and build (repspark-next)
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/Core/RepSparkWebApp/Scripts/ReactComponents/repspark-next
+          yarn --version
+          npm --version
+          node --version
+          npm uninstall -g typescript
+          yarn install
+          yarn build
+          cd ${{ env.GIT_DIR_PATH }}/Core/RepSparkWebApp/Scripts/ReactComponents/repspark-next/build
+
+          New-Item -Name "js" -ItemType "directory"; Get-Item *.js | Move-Item -Destination "js"
+          New-Item -Name "css" -ItemType "directory"; Get-Item *.css | Move-Item -Destination "css"
+
+          cd ${{ env.GIT_DIR_PATH }}/Core/RepSparkWebApp
+          echo inside_RepSparkWebApp_directory
+          $head = Get-Content Scripts/ReactComponents/repspark-next/build/index.html | Out-String | Select-String -Pattern "<github_actions_build_hook \/>((.|[\n\r])*)<\/head>" | % { $_.Matches.Groups[1].Value }; (Get-Content Areas/Next/Views/Next/Index.cshtml) -replace "@*@GITHUB_ACTIONS_BUILD_HOOK@*@", $head | Set-Content Areas/Next/Views/Next/Index.cshtml
+          $head = Get-Content Scripts/ReactComponents/repspark-next/build/index.html | Out-String | Select-String -Pattern "<github_actions_build_hook \/>((.|[\n\r])*)<\/head>" | % { $_.Matches.Groups[1].Value }; (Get-Content Areas/Events/Views/EventManager/Index.cshtml) -replace "@*@GITHUB_ACTIONS_BUILD_HOOK@*@", $head | Set-Content Areas/Events/Views/EventManager/Index.cshtml
+          $head = Get-Content Scripts/ReactComponents/repspark-next/build/index.html | Out-String | Select-String -Pattern "<github_actions_build_hook \/>((.|[\n\r])*)<\/head>" | % { $_.Matches.Groups[1].Value }; (Get-Content Areas/Events/Views/EventReport/Index.cshtml) -replace "@*@GITHUB_ACTIONS_BUILD_HOOK@*@", $head | Set-Content Areas/Events/Views/EventReport/Index.cshtml
+          $head = Get-Content Scripts/ReactComponents/repspark-next/build/index.html | Out-String | Select-String -Pattern "<github_actions_build_hook \/>((.|[\n\r])*)<\/head>" | % { $_.Matches.Groups[1].Value }; (Get-Content Areas/Next/Views/UserReports/Index.cshtml) -replace "@*@GITHUB_ACTIONS_BUILD_HOOK@*@", $head | Set-Content Areas/Next/Views/UserReports/Index.cshtml
+          $head = Get-Content Scripts/ReactComponents/repspark-next/build/index.html | Out-String | Select-String -Pattern "<github_actions_build_hook \/>((.|[\n\r])*)<\/head>" | % { $_.Matches.Groups[1].Value }; (Get-Content Areas/Next/Views/MyOrders/Index.cshtml) -replace "@*@GITHUB_ACTIONS_BUILD_HOOK@*@", $head | Set-Content Areas/Next/Views/MyOrders/Index.cshtml
+        env:
+          CI: ""
+
+      - name: Install dependencies and build (multi-date-ordering)
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/Core/RepSparkWebApp/Scripts/ReactComponents/multi-date-ordering
+          yarn install
+          yarn build  
+
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/
+          $body = Get-Content Scripts/ReactComponents/multi-date-ordering/build/index.html | Select-String -Pattern "<body[^>]*>((.|[\n\r])*)<\/body>" | % { $_.Matches.Groups[1].Value }; $body = $body -replace "/static/js/", "https://cdn.repspark.net/js/"; (Get-Content Areas/Cart/Views/MultiDateOrder/Index.cshtml) -replace "/*@GITHUB_ACTIONS_BUILD_HOOK@*/", $body | Set-Content Areas/Cart/Views/MultiDateOrder/Index.cshtml
+          $css = Get-Content Scripts/ReactComponents/multi-date-ordering/build/index.html | Select-String -Pattern "<github_actions_build_hook[^>]*>((.|[\n\r])*)<\/head>" | % { $_.Matches.Groups[1].Value }; $css = $css -replace "/static/css/", "https://cdn.repspark.net/css/"; (Get-Content Areas/Cart/Views/MultiDateOrder/Index.cshtml) -replace "@*@GITHUB_ACTIONS_BUILD_HOOK_CSS@*@", $css | Set-Content Areas/Cart/Views/MultiDateOrder/Index.cshtml
+          echo index.html updates done;
+        env:
+          CI: ""
+
+      - name: Install dependencies and build (assortment-next)
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/Core/RepSparkWebApp/Scripts/ReactComponents/assortment-next
+          yarn install
+          yarn build  
+
+          cd ${{ env.GIT_DIR_PATH }}/Core/RepSparkWebApp/
+          $body = Get-Content Scripts/ReactComponents/assortment-next/build/index.html | Select-String -Pattern "<body[^>]*>((.|[\n\r])*)<\/body>" | % { $_.Matches.Groups[1].Value }; (Get-Content Areas/Assortments/Views/Assortment/Index.cshtml) -replace "/*@GITHUB_ACTIONS_BUILD_HOOK@*/", $body | Set-Content Areas/Assortments/Views/Assortment/Index.cshtml
+
+      - name: Build Repspark WebApp
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/Core
+          nuget
+          nuget restore RepSparkSolution.sln
+          cd RepSparkWebApp
+          & "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\MSBuild\\Current\\Bin\\MSBuild.exe" RepSparkWebApp.csproj /p:Configuration=Release /p:BuildInParallel=true /p:AllowedReferenceRelatedFileExtensions=none /p:WebPublishMethod=FileSystem /p:DeleteExistingFiles=true /p:publishUrl=_Publish\\ /p:PrecompileBeforePublish=true /p:EnableUpdateable=false /t:WebPublish /m:4 /verbosity:minimal
+          sleep 80
+          cd _Publish
+          ls *.less -Recurse | foreach {rm $_}
+          Remove-Item Configs -Force -Recurse -ErrorAction SilentlyContinue
+        env:
+          NUGET_PACKAGES: R:\NuGetPackages
+
+      - name: React Components .tsx compilation
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/Core/RepSparkWebApp/Scripts/ReactComponents
+          npm install -g typescript@${{ env.TYPESCRIPT_VERSION }}; tsc --version
+          tsc --jsx react WishListSelectorComponent.tsx
+          (Get-Content WishListSelectorComponent.js) -replace "var React = require(\'react\');", "" | Set-Content WishListSelectorComponent.js
+          (Get-Content WishListSelectorComponent.js) -replace "var ReactDOM = require(\'react-dom\');", "" | Set-Content WishListSelectorComponent.js
+        env:
+          TYPESCRIPT_VERSION: ${{ vars.TYPESCRIPT_VERSION }}
+
+      - name: ReactComponents - build destination
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}
+          Copy-Item -Path "Core/RepSparkWebApp/Scripts/ReactComponents/WishListSelectorComponent.js" -Destination "Core/RepSparkWebApp/_Publish/Scripts/ReactComponents/WishListSelectorComponent.js" -Force -Verbose
+          Copy-Item -Path "Core/RepSparkWebApp/Scripts/ReactComponents/build" -Destination "Core/RepSparkWebApp/_Publish/Scripts/ReactComponents/build" -Recurse -Force -Verbose
+          Copy-Item -Path "Core/RepSparkWebApp/Scripts/CchOutput" -Destination "Core/RepSparkWebApp/_Publish/Scripts/CchOutput" -Recurse -Force -Verbose
+          Copy-Item -Path "CCH/Customer-Communication-Hub-UI/src/assets" -Destination "Core/RepSparkWebApp/_Publish/Scripts/CchOutput/assets" -Recurse -Force -Verbose
+
+      - name: Daemon
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/Daemon/RepSpark.Integration.Daemon
+          dotnet --version
+          dotnet publish -c Release
+
+      - name: Repspark AppAPi
+        run: |
+          echo "NUGET_PACKAGES: $NUGET_PACKAGES"
+
+          cd ${{ env.GIT_DIR_PATH}}/RepSpark.API/Repspark.AppApi
+          dotnet --version
+          dotnet publish -c Release -f net8.0 --force -o RepSparkAPI_Publish -r win-x64 --self-contained
+
+          #Below Step - Check if its neeeed. Currently, this throws NOT FOUND error in Jenkins
+          # Copy-Item -Path "WebConfig/*" -Destination "RepSparkAPI_Publish/" -Force
+
+          cd ${{ env.GIT_DIR_PATH}}/RepSpark.API/Repspark.AppApi/RepSparkAPI_Publish
+          Remove-Item WebConfig -Force -Recurse -ErrorAction SilentlyContinue
+        env:
+          NUGET_PACKAGES: R:\NuGetPackages
+
+      - name: DynamicWebServices
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSpark.DynamicWebServices
+          dotnet publish -c Release --self-contained -r win-x64
+
+          #Below Step - Check if its neeeed. Currently, this throws NOT FOUND error in Jenkins
+          # Copy-Item -Path "C:/ApiDocs" -Destination "bin/Release/net8.0/win-x64/publish/docs" -Force -Verbose -Recurse
+
+      - name: JsonSchemaGenerator
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/CI/RepSpark.JsonSchemaGenerator
+          dotnet publish -c Release --self-contained -r win-x64
+
+      - name: DBUp
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}//CI/RepSpark.DBUp
+          dotnet publish -c Release --self-contained -r win-x64
+
+      - name: Clear Caching
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/CI/RepSpark.Caching.GitHubActions
+          dotnet publish -c Release --self-contained -r win-x64
+
+      - name: GenericIntegration
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/GenericIntegration
+          dotnet publish -c Release --self-contained -r win-x64 -f net8.0
+
+          cd ${{ env.GIT_DIR_PATH }}/GenericIntegration/RepSpark.Integration.Program/bin/Release/net8.0/win-x64/publish
+          del *.pdb
+          del appsettings.debug.json
+
+      - name: CCH WebAPI
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}/CCH/Customer-Communication-Hub/Repspark.CCH.WebApi
+          dotnet publish -c Release -f net8.0 --force -o CCH_Publish -r win-x64 --self-contained
+          if (-Not (Test-Path -Path "CCH_Publish/EmailTemplates")) {
+          New-Item -Path "CCH_Publish/EmailTemplates" -ItemType Directory
+          }
+          Copy-Item -Path "EmailTemplates/*" -Destination "CCH_Publish/EmailTemplates/" -Force -Verbose
+          Copy-Item -Path "WebConfig/*" -Destination "CCH_Publish/" -Force
+
+          cd ${{ env.GIT_DIR_PATH }}/CCH/Customer-Communication-Hub/Repspark.CCH.WebApi/CCH_Publish
+          Remove-Item WebConfig -Force -Recurse -ErrorAction SilentlyContinue
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  nodejs:
+    runs-on:
+      - nodejs
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, build]
+    steps:
+      - name: ReactComponents - WishList
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/Scripts/ReactComponents/WishList
+          npm install --legacy-peer-deps
+          npm run webpack.wishlists.prod
+
+      - name: ReactComponents - brandedlandingpage
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/Scripts/ReactComponents/brandedlandingpage
+          npm install --legacy-peer-deps
+          npm run webpack.BLP.prod
+
+      - name: ReactComponents - assortments
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/Scripts/ReactComponents/assortments
+          npm install --legacy-peer-deps
+          npm run webpack.assortments.prod
+
+      - name: ReactComponents - Linesheets
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/Scripts/ReactComponents/Linesheets
+          npm install --legacy-peer-deps
+          npm run webpack.linesheets.prod
+
+      - name: ReactComponents - chat
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/Scripts/ReactComponents/chat
+          npm install --legacy-peer-deps
+          npm run webpack.chat.prod
+
+      - name: ReactComponents - image-manager
+        run: |
+          cd ${{ env.GIT_DIR_PATH}}/Core/RepSparkWebApp/Scripts/ReactComponents/image-manager
+          npm install --legacy-peer-deps
+          npm run webpack.imagemanager.prod
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  update-api-docs:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [msbuild, prerequisite, set-environment]
+    steps:
+      - name: update-api-docs
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          Remove-Item R:/Schemas/*.* -Force -Recurse -ErrorAction SilentlyContinue
+          CI/RepSpark.JsonSchemaGenerator/bin/Release/net8.0/win-x64/publish/RepSpark.JsonSchemaGenerator.exe -target file
+          if (-not (Test-Path "Core/RepSpark.DynamicWebServices/bin/Release/net8.0/win-x64/publish/schemas")) {
+              New-Item -Type dir "Core/RepSpark.DynamicWebServices/bin/Release/net8.0/win-x64/publish/schemas"
+          }   
+          if (-not (Test-Path "R:/Schemas")) {
+              New-Item -Type Directory "R:/Schemas"
+          }
+          Copy-Item -Path "R:/Schemas/*" -Destination "Core/RepSpark.DynamicWebServices/bin/Release/net8.0/win-x64/publish/schemas" -Force -Verbose -Recurse
+          Copy-Item -Path "R:/Schemas/*" -Destination "Core/RepSpark.DynamicWebServices/OpenAPI" -Force -Verbose -Recurse
+
+          cd Core/RepSpark.DynamicWebServices/OpenAPI
+          C:/npm-global/rdme openapi "core-resources.openapi.yaml" --id=${{env.OPENAPI_CORE_ID}}
+          C:/npm-global/rdme openapi "reporting-resources.openapi.yaml" --id=${{env.OPENAPI_REPORTING_ID}}
+          C:/npm-global/rdme openapi "advanced-resources.openapi.yaml" --id=${{env.OPENAPI_ADVANCED_ID}}
+        env:
+          OPENAPI_CORE_ID: ${{secrets.OPENAPI_CORE_ID}}
+          OPENAPI_REPORTING_ID: ${{secrets.OPENAPI_REPORTING_ID}}
+          OPENAPI_ADVANCED_ID: ${{secrets.OPENAPI_ADVANCED_ID}}
+          GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  compress-webapp:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, update-api-docs]
+    steps:
+      - name: compress-webapp
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          Add-Type -Assembly System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory("Core/RepSparkWebApp/_Publish", "Core/RepSparkWebApp/RepSparkWebApp-${{ github.run_number }}.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  compress-daemon-and-api:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, compress-webapp]
+    steps:
+      - name: compress-daemon-and-api
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          Add-Type -Assembly System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory("Daemon/RepSpark.Integration.Daemon/bin/Release/net8.0/win-x64/publish", "Daemon/RepSpark.Integration.Daemon/bin/Daemon-${{ github.run_number }}.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
+          Add-Type -Assembly System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory("Core/RepSpark.DynamicWebServices/bin/Release/net8.0/win-x64/publish", "Core/RepSpark.DynamicWebServices/WebAPI-${{ github.run_number }}.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
+          Add-Type -Assembly System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory("GenericIntegration/RepSpark.Integration.Program/bin/Release/net8.0/win-x64/publish", "GenericIntegration/RepSpark.Integration.Program/gim-win-x64-latest.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  compress-cch-api:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, compress-daemon-and-api]
+    steps:
+      - name: compress-cch-api
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          Add-Type -Assembly System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory("CCH/Customer-Communication-Hub/Repspark.CCH.WebApi/CCH_Publish", "CCH/Customer-Communication-Hub/CchApi-${{ github.run_number }}.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  compress-repspark-app-api:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, compress-cch-api]
+    steps:
+      - name: compress-repspark-app-api
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+            Add-Type -Assembly System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory("RepSpark.API/RepSpark.AppApi/RepSparkAPI_Publish", "RepSpark.API/RepSpark.AppApi/RskAppApi-${{ github.run_number }}.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  compress-accelerate-app:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, compress-repspark-app-api]
+    steps:
+      - name: compress-accelerate-app
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          Add-Type -Assembly System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory("Core/RepSparkWebApp/Scripts/ReactComponents/Accelerate/build/", "Core/RepSparkWebApp/Scripts/ReactComponents/Accelerate/Accelerate-${{ github.run_number }}.zip", [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  upload-to-s3:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs:
+      [
+        set-environment,
+        prerequisite,
+        compress-webapp,
+        compress-daemon-and-api,
+        compress-cch-api,
+        compress-repspark-app-api,
+        compress-accelerate-app,
+      ]
+    steps:
+      - name: upload-to-s3
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          $GitBranch = "${{ needs.set-environment.outputs.environment }}"
+          $BuildNumber = ${{ github.run_number }}
+          $SourceFile = "Core\RepSparkWebApp\RepSparkWebApp-$BuildNumber.zip"
+          $BuildBucketName = "${{ env.build_bucket_name }}"
+          $CdnBucketName = "${{ env.cdn_bucket_name }}"
+
+          $DestinationPath = "$GitBranch/$BuildNumber/RepSparkWebApp-$BuildNumber.zip"
+          aws s3 cp Core/RepSparkWebApp/RepSparkWebApp-$BuildNumber.zip      s3://$BuildBucketName/$GitBranch/$BuildNumber/RepSparkWebApp-$BuildNumber.zip
+          aws s3 cp Daemon/RepSpark.Integration.Daemon/bin/Daemon-$BuildNumber.zip  s3://$BuildBucketName/$GitBranch/$BuildNumber/Daemon-$BuildNumber.zip
+          aws s3 cp Core/RepSpark.DynamicWebServices/WebAPI-$BuildNumber.zip   s3://$BuildBucketName/$GitBranch/$BuildNumber/WebAPI-$BuildNumber.zip
+          aws s3 cp CCH/Customer-Communication-Hub/CchApi-$BuildNumber.zip  s3://$BuildBucketName/$GitBranch/$BuildNumber/CchApi-$BuildNumber.zip
+          aws s3 cp GenericIntegration/RepSpark.Integration.Program/gim-win-x64-latest.zip   s3://$CdnBucketName/gim/${{github.ref_slug}}/gim-win-x64-latest.zip
+          aws s3 cp RepSpark.API/RepSpark.AppApi/RskAppApi-$BuildNumber.zip   s3://$BuildBucketName/$GitBranch/$BuildNumber/RskAppApi-$BuildNumber.zip
+          aws s3 cp Core/RepSparkWebApp/Scripts/ReactComponents/multi-date-ordering/build/static/js/  s3://$CdnBucketName/js/ --recursive --cache-control public,max-age=31536000 --content-type application/javascript
+          aws s3 cp Core/RepSparkWebApp/Scripts/ReactComponents/multi-date-ordering/build/static/css/ s3://$CdnBucketName/css/ --recursive  --cache-control public,max-age=31536000 --content-type  text/css
+          aws s3 cp Core/RepSparkWebApp/Scripts/ReactComponents/repspark-next/build/js/  s3://$CdnBucketName/static/js/ --recursive  --cache-control public,max-age=31536000 --content-type  application/javascript
+          aws s3 cp Core/RepSparkWebApp/Scripts/ReactComponents/repspark-next/build/css/     s3://$CdnBucketName/static/css/ --recursive  --cache-control public,max-age=31536000 --content-type  text/css
+          aws s3 cp Core/RepSparkWebApp/Scripts/ReactComponents/assortment-next/build/static/js/   s3://$CdnBucketName/static/js/ --recursive  --cache-control public,max-age=31536000 --content-type  application/javascript
+          aws s3 cp Core/RepSparkWebApp/Scripts/ReactComponents/Accelerate/Accelerate-$BuildNumber.zip   s3://$BuildBucketName/$GitBranch/$BuildNumber/Accelerate-$BuildNumber.zip
+        env:
+          aws_region: ${{ vars.AWS_REGION }}
+          build_bucket_name: ${{ vars.BUILD_BUCKET_NAME }}
+          cdn_bucket_name: ${{ vars.CDN_BUCKET_NAME }}
+          GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  get-computer-name:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    outputs:
+      COMPUTER_WEB_BASE64: ${{ steps.get-computer-name.outputs.COMPUTER_WEB_BASE64 }}
+      COMPUTER_WINAPPS_BASE64: ${{ steps.get-computer-name.outputs.COMPUTER_WINAPPS_BASE64 }}
+    needs: [set-environment, prerequisite, upload-to-s3]
+    steps:
+      - name: get-computer-name
+        id: get-computer-name
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          echo "test"
+          $COMPUTER_WEB = @() # Initialize an empty array
+          $COMPUTER_WINAPPS = @() # Initialize an empty array
+
+          $COMPUTER_WEB = Get-ADComputer -Filter 'Name -like "${{ env.WEB_SERVER_PREFIX }}"' | Select-Object -Property Name
+          $COMPUTER_WINAPPS = Get-ADComputer -Filter 'Name -like "${{ env.WINAPPS_SERVER_PREFIX }}*"' | Select-Object -Property Name
+
+          $COMPUTER_WEB_JSON = $COMPUTER_WEB | ConvertTo-Json -Compress
+          $COMPUTER_WINAPPS_JSON = $COMPUTER_WINAPPS | ConvertTo-Json -Compress
+
+          # Check if $COMPUTER_WEB_JSON is not null or empty
+          if (![string]::IsNullOrEmpty($COMPUTER_WEB_JSON)) {
+              $COMPUTER_WEB_BASE64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($COMPUTER_WEB_JSON))
+          } else {
+              Write-Warning "COMPUTER_WEB_JSON is null or empty."
+          }
+          if (![string]::IsNullOrEmpty($COMPUTER_WINAPPS_JSON)) {
+            $COMPUTER_WINAPPS_BASE64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($COMPUTER_WINAPPS_JSON))
+          } else {
+              Write-Warning "COMPUTER_WINAPPS_JSON is null or empty."
+          }
+          echo "COMPUTER_WEB_BASE64=$COMPUTER_WEB_BASE64" >> $Env:GITHUB_OUTPUT
+          echo "COMPUTER_WINAPPS_BASE64=$COMPUTER_WINAPPS_BASE64" >> $Env:GITHUB_OUTPUT
+        env:
+          WEB_SERVER_PREFIX: ${{ vars.WEB_SERVER_PREFIX }}
+          WINAPPS_SERVER_PREFIX: ${{ vars.WINAPPS_SERVER_PREFIX }}
+          GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  copy-from-s3:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, get-computer-name]
+    steps:
+      - name: copy-from-s3
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          $COMPUTER_WEB_BASE64 = "${{ needs.get-computer-name.outputs.COMPUTER_WEB_BASE64 }}"
+          $COMPUTER_WINAPPS_BASE64 = "${{ needs.get-computer-name.outputs.COMPUTER_WINAPPS_BASE64 }}"
+
+          function Convert-Base64ToJson {
+            param (
+                [string]$base64Str
+            )
+            try {
+                if ([string]::IsNullOrWhiteSpace($base64Str)) {
+                    echo $null
+                } else {
+                    $bytes = [Convert]::FromBase64String($base64Str)
+                    $jsonStr = [Text.Encoding]::UTF8.GetString($bytes)
+                    $obj = $jsonStr | ConvertFrom-Json
+                    return $obj
+                }
+            } catch {
+                Write-Error "Failed to convert from Base64 or JSON: $_"
+                return $null
+            }
+          }
+          $COMPUTER_WEB_ARRAY = Convert-Base64ToJson -base64Str $COMPUTER_WEB_BASE64
+          $COMPUTER_WINAPPS_ARRAY = Convert-Base64ToJson -base64Str $COMPUTER_WINAPPS_BASE64
+
+          if (($null -ne $COMPUTER_WEB_ARRAY) -or ($null -ne $COMPUTER_WINAPPS_ARRAY)) {
+          $WEB_COMPUTER = @($COMPUTER_WEB_ARRAY.Name)
+          echo $WEB_COMPUTER
+          $WINAPPS_COMPUTER = @($COMPUTER_WINAPPS_ARRAY.Name)
+          echo $WINAPPS_COMPUTER
+          cd ${{ env.GIT_DIR_PATH }}/CI/DeploymentScripts
+          ./CopyArtifacts.ps1 -version ${{ github.run_number }} -environment "${{ needs.set-environment.outputs.environment }}" -web_computer $WEB_COMPUTER `
+          -winapps_computer $WINAPPS_COMPUTER -aws_region ${{ env.AWS_REGION }} -s3_region ${{ env.S3_REGION }} -endpoint_url ${{ env.ENDPOINT_URL }} `
+          -build_bucket_name ${{ env.BUILD_BUCKET_NAME }}
+
+          }
+          else {
+              echo "No Computers available."
+          }
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_REGION: ${{ vars.S3_REGION }}
+          ENDPOINT_URL: ${{ vars.ENDPOINT_URL }}
+          BUILD_BUCKET_NAME: ${{ vars.BUILD_BUCKET_NAME }}
+          GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  start-deployment:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, get-computer-name, copy-from-s3]
+    steps:
+      - name: start-deployment
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          $COMPUTER_WEB_BASE64 = "${{ needs.get-computer-name.outputs.COMPUTER_WEB_BASE64 }}"
+
+          function Convert-Base64ToJson {
+            param (
+                [string]$base64Str
+            )
+            try {
+                if ([string]::IsNullOrWhiteSpace($base64Str)) {
+                    echo $null
+                } else {
+                    $bytes = [Convert]::FromBase64String($base64Str)
+                    $jsonStr = [Text.Encoding]::UTF8.GetString($bytes)
+                    $obj = $jsonStr | ConvertFrom-Json
+                    return $obj
+                }
+            } catch {
+                Write-Error "Failed to convert from Base64 or JSON: $_"
+                return $null
+            }
+          }
+          $COMPUTER_WEB_ARRAY = Convert-Base64ToJson -base64Str $COMPUTER_WEB_BASE64
+
+          if ($null -ne $COMPUTER_WEB_ARRAY) {
+          $WEB_COMPUTER = @($COMPUTER_WEB_ARRAY.Name)
+          echo $WEB_COMPUTER
+          cd ${{ env.GIT_DIR_PATH }}/CI/DeploymentScripts
+          ./StartDeployment.ps1 -version ${{ github.run_number }} -environment "${{ needs.set-environment.outputs.environment }}" -web_computer $WEB_COMPUTER
+          }
+          else {
+              echo "No Computers available."
+          }
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  json-schema-generator:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, start-deployment]
+    steps:
+      - name: json-schema-generator
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          & CI/RepSpark.JsonSchemaGenerator/bin/Release/net8.0/win-x64/publish/RepSpark.JsonSchemaGenerator.exe -target database -version ${{ github.run_number }} -environment "${{ needs.set-environment.outputs.environment }}"
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  db-up:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, json-schema-generator]
+    steps:
+      - name: db-up
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          CI/RepSpark.DBUp/bin/Release/net8.0/win-x64/publish/RepSpark.DBUp.exe environment:"${{ needs.set-environment.outputs.environment }}"
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  flush-redis:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, db-up]
+    steps:
+      - name: flush-redis
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          cd ${{ env.GIT_DIR_PATH }}
+          CI/RepSpark.Caching.GitHubActions/bin/Release/net8.0/win-x64/publish/RepSpark.Caching.GitHubActions.exe "${{ needs.set-environment.outputs.environment }}"
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  end-deployment:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, prerequisite, get-computer-name, flush-redis]
+    steps:
+      - name: end-deployment
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        run: |
+          $COMPUTER_WEB_BASE64 = "${{ needs.get-computer-name.outputs.COMPUTER_WEB_BASE64 }}"
+
+          function Convert-Base64ToJson {
+            param (
+                [string]$base64Str
+            )
+            try {
+                if ([string]::IsNullOrWhiteSpace($base64Str)) {
+                    echo $null
+                } else {
+                    $bytes = [Convert]::FromBase64String($base64Str)
+                    $jsonStr = [Text.Encoding]::UTF8.GetString($bytes)
+                    $obj = $jsonStr | ConvertFrom-Json
+                    return $obj
+                }
+            } catch {
+                Write-Error "Failed to convert from Base64 or JSON: $_"
+                return $null
+            }
+          }
+          $COMPUTER_WEB_ARRAY = Convert-Base64ToJson -base64Str $COMPUTER_WEB_BASE64
+
+          if ($null -ne $COMPUTER_WEB_ARRAY) {
+          $WEB_COMPUTER = @($COMPUTER_WEB_ARRAY.Name)
+          echo $WEB_COMPUTER
+          cd ${{ env.GIT_DIR_PATH }}/CI/DeploymentScripts
+          ./EndDeployment.ps1 -version ${{ github.run_number }} -environment "${{ needs.set-environment.outputs.environment }}" -web_computer $WEB_COMPUTER
+          }
+          else {
+              echo "No Computers available."
+          }
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  newrelic-deployment:
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs: [set-environment, end-deployment]
+    steps:
+      - name: newrelic-deployment
+        working-directory: ${{ env.GIT_DIR_PATH }}
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
+        run: |
+          $headers = @{
+          'X-Api-Key' = '${{ secrets.NEWRELIC_APIKEY }}'
+          }
+          $body = @{
+              deployment = @{
+                  revision = '${{ github.run_number }}'
+              }
+          } | ConvertTo-Json
+
+          $urls = @(
+              'https://api.newrelic.com/v2/applications/1536858282/deployments.json'
+              'https://api.newrelic.com/v2/applications/1507177707/deployments.json'
+              'https://api.newrelic.com/v2/applications/1507177812/deployments.json'
+          )
+
+          foreach ($url in $urls) {
+              Invoke-WebRequest -Uri $url -Method POST -ContentType 'application/json; charset=utf-8' -Headers $headers -Body $body
+          }
+        env:
+          NEWRELIC_APIKEY: ${{ secrets.NEWRELIC_APIKEY }}
+          GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  slack-notify-build-success-and-cleanup:
+    if:
+      github.event_name == 'pull_request' && (needs.set-environment.result == 'success' &&
+      needs.prerequisite.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.build-admin-accelerate.result == 'success' &&
+      needs.build-cch.result == 'success' &&
+      needs.msbuild.result == 'success' &&
+      needs.nodejs.result == 'success')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs:
+      [
+        set-environment,
+        deployment-window,
+        prerequisite,
+        build,
+        build-admin-accelerate,
+        build-cch,
+        msbuild,
+        nodejs,
+      ]
+    steps:
+      - name: Notify Slack (Only Build)
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "image",
+                      "image_url": "https://via.placeholder.com/15/28a745/28a745.png",
+                      "alt_text": "build status"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Build Succeeded:* `${{ needs.set-environment.outputs.environment }}` #`${{ github.run_number }}`"
+                    }
+                  ]
+                }
+              ]
+            }
+      - name: Clean up workspace
+        run: |
+          Write-Output "Cleaning up workspace..."
+          Remove-Item -Path "\\?\${{ github.workspace }}\${{ needs.prerequisite.outputs.branch_name }}" -Recurse -Force
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  slack-notify-deploy-success:
+    if:
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (needs.set-environment.result == 'success' &&
+      needs.prerequisite.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.build-admin-accelerate.result == 'success' &&
+      needs.build-cch.result == 'success' &&
+      needs.msbuild.result == 'success' &&
+      needs.nodejs.result == 'success' &&
+      needs.update-api-docs.result == 'success' &&
+      needs.compress-webapp.result == 'success' &&
+      needs.compress-daemon-and-api.result == 'success' &&
+      needs.compress-cch-api.result == 'success' &&
+      needs.compress-repspark-app-api.result == 'success' &&
+      needs.compress-accelerate-app.result == 'success' &&
+      needs.upload-to-s3.result == 'success' &&
+      needs.get-computer-name.result == 'success' &&
+      needs.copy-from-s3.result == 'success' &&
+      needs.start-deployment.result == 'success' &&
+      needs.json-schema-generator.result == 'success' &&
+      needs.db-up.result == 'success' &&
+      needs.flush-redis.result == 'success' &&
+      needs.end-deployment.result == 'success')
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs:
+      [
+        set-environment,
+        deployment-window,
+        prerequisite,
+        build,
+        build-admin-accelerate,
+        build-cch,
+        msbuild,
+        nodejs,
+        update-api-docs,
+        compress-webapp,
+        compress-daemon-and-api,
+        compress-cch-api,
+        compress-repspark-app-api,
+        compress-accelerate-app,
+        upload-to-s3,
+        get-computer-name,
+        copy-from-s3,
+        start-deployment,
+        json-schema-generator,
+        db-up,
+        flush-redis,
+        end-deployment,
+      ]
+    steps:
+      - name: Notify Slack (Build and Deploy)
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "image",
+                      "image_url": "https://via.placeholder.com/15/28a745/28a745.png",
+                      "alt_text": "build status"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Build Succeeded:* `${{ needs.set-environment.outputs.environment }}` #`${{ github.run_number }}`"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+
+  slack-notify-failure:
+    if: ${{ always() && contains(needs.*.result, 'failure')}}
+    runs-on:
+      - repspark-runner
+    environment: ${{ needs.set-environment.outputs.environment }}
+    needs:
+      [
+        set-environment,
+        deployment-window,
+        prerequisite,
+        build,
+        build-admin-accelerate,
+        build-cch,
+        msbuild,
+        nodejs,
+        update-api-docs,
+        compress-webapp,
+        compress-daemon-and-api,
+        compress-cch-api,
+        compress-repspark-app-api,
+        compress-accelerate-app,
+        upload-to-s3,
+        get-computer-name,
+        copy-from-s3,
+        start-deployment,
+        json-schema-generator,
+        db-up,
+        flush-redis,
+        end-deployment,
+        newrelic-deployment,
+      ]
+    steps:
+      - name: slack notification - failure
+        id: slack-failure
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "image",
+                      "image_url": "https://via.placeholder.com/15/dc3545/dc3545.png",
+                      "alt_text": "build status"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Build Failed:* `${{ needs.set-environment.outputs.environment }}` #`${{ github.run_number }}`"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
+  
+  cleanup:
+    runs-on: repspark-runner
+    needs: [
+        set-environment,
+        deployment-window,
+        prerequisite,
+        build,
+        build-admin-accelerate,
+        build-cch,
+        msbuild,
+        nodejs,
+        update-api-docs,
+        compress-webapp,
+        compress-daemon-and-api,
+        compress-cch-api,
+        compress-repspark-app-api,
+        compress-accelerate-app,
+        upload-to-s3,
+        get-computer-name,
+        copy-from-s3,
+        start-deployment,
+        json-schema-generator,
+        db-up,
+        flush-redis,
+        end-deployment,
+        newrelic-deployment,
+      ]
+    if: ${{ failure() || success() }}
+
+    steps:
+      - name: Clean up workspace
+        run: |
+          Write-Output "Cleaning up workspace..."
+          Remove-Item -Path "\\?\${{ github.workspace }}\${{ needs.prerequisite.outputs.branch_name }}" -Recurse -Force
+    env:
+      GIT_DIR_PATH: ${{ needs.prerequisite.outputs.GIT_DIR_PATH }}
